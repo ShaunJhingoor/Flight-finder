@@ -1,103 +1,137 @@
-import Image from "next/image";
+"use client";
+import { useState } from "react";
+import AirportAutocomplete from "./components/AirportAutocomplete";
+import image from "./assets/bgImage.png";
+type Result = {
+  price: number;
+  duration: string;
+  stops: number;
+  route: string;
+  carriers: string[];
+  deep_link: string | null;
+};
 
-export default function Home() {
+export default function FlightsPage() {
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState<Result[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    setResults([]);
+    const form = new FormData(e.currentTarget);
+    const payload = Object.fromEntries(form.entries());
+
+    try {
+      const res = await fetch("/api/flights", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Search failed");
+      setResults(json.results || []);
+    } catch (err: any) {
+      setError(err.message || "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <div className="min-h-screen min-w-screen  bg-[url('./assets/bgImage.png')] bg-cover bg-center bg-no-repeat text-white flex items-center justify-center">
+      <main className="max-w-4xl w-full mx-auto p-6 space-y-6">
+        <h1 className="text-2xl font-semibold text-center">
+          Find Flights (Amadeus)
+        </h1>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+        <form onSubmit={onSubmit} className="grid grid-cols-2 gap-5">
+          <AirportAutocomplete nameCode="from" label="From" required />
+          <AirportAutocomplete nameCode="to" label="To" required />
+
+          <label className="text-sm">
+            <span className="block mb-1">Depart</span>
+            <input
+              type="date"
+              name="depart"
+              required
+              className="border p-2 rounded w-full"
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+          </label>
+          <label className="text-sm">
+            <span className="block mb-1">Return (optional)</span>
+            <input
+              type="date"
+              name="return"
+              className="border p-2 rounded w-full"
+            />
+          </label>
+
+          <label className="text-sm">
+            <span className="block mb-1">Adults</span>
+            <input
+              type="number"
+              name="adults"
+              min={1}
+              defaultValue={1}
+              className="border p-2 rounded w-full"
+            />
+          </label>
+
+          <label className="text-sm">
+            <span className="block mb-1">Cabin</span>
+            <select
+              name="cabin"
+              defaultValue="M"
+              className="border p-2 rounded w-full"
+            >
+              <option value="M">Economy</option>
+              <option value="W">Premium Economy</option>
+              <option value="C">Business</option>
+              <option value="F">First</option>
+            </select>
+          </label>
+
+          <button
+            type="submit"
+            className="col-span-2 bg-[#1c3a53] text-white rounded p-2 disabled:opacity-60"
+            disabled={loading}
           >
-            Read our docs
-          </a>
-        </div>
+            {loading ? "Searching..." : "Search"}
+          </button>
+        </form>
+
+        {error && <p className="text-red-600">{error}</p>}
+
+        {results.length > 0 && (
+          <section className="space-y-4">
+            {results.map((r, i) => (
+              <div key={i} className="border rounded p-3">
+                <div className="flex items-center justify-between">
+                  <div className="font-medium">
+                    ${r.price} • {r.stops} stop{r.stops === 1 ? "" : "s"} •{" "}
+                    {r.duration}
+                  </div>
+                  <button
+                    className="underline"
+                    onClick={() =>
+                      alert("Implement pricing/booking flow next.")
+                    }
+                  >
+                    Select
+                  </button>
+                </div>
+                <div className="text-sm opacity-85">{r.route}</div>
+                <div className="text-xs opacity-60">
+                  {r.carriers.join(", ")}
+                </div>
+              </div>
+            ))}
+          </section>
+        )}
       </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
     </div>
   );
 }
