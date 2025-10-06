@@ -1,154 +1,221 @@
-// app/api/flights/route.ts
 import { NextResponse } from "next/server";
 import { searchFlightOffers } from "../../lib/amadeus";
+import { llmParseQuery, llmExpandCombos } from "../../lib/llmagent";
+import { runWithLimit } from "../../utils/concurrency";
 
-async function tryCombos(base: {
-  origin: string;
-  destination: string;
-  departDate: string;
-  returnDate?: string;
-  adults: number;
-  cabin: "ECONOMY" | "PREMIUM_ECONOMY" | "BUSINESS" | "FIRST";
-}) {
-  const origins = [base.origin, ...(base.origin === "JFK" ? ["NYC"] : [])]; // add city group
-  const dests = [
-    base.destination,
-    ...(base.destination === "RIC" ? ["ORF", "DCA", "IAD"] : []),
-  ];
+export const runtime = "nodejs";
 
-  // build ±2 day windows
-  const flex = (iso: string) => {
-    const d = new Date(iso + "T00:00:00");
-    const dates: string[] = [];
-    for (let i = -2; i <= 2; i++) {
-      const x = new Date(d);
-      x.setDate(x.getDate() + i);
-      dates.push(x.toISOString().slice(0, 10));
-    }
-    return dates;
-  };
-  const depDates = flex(base.departDate);
-  const retDates = base.returnDate ? flex(base.returnDate) : [undefined];
-
-  for (const o of origins) {
-    for (const t of dests) {
-      for (const dd of depDates) {
-        for (const rr of retDates) {
-          const offers = await searchFlightOffers({
-            origin: o,
-            destination: t,
-            departDate: dd,
-            returnDate: rr,
-            adults: base.adults,
-            cabin: base.cabin,
-            currency: "USD",
-            max: 200,
-          });
-          if (offers?.length) {
-            return {
-              offers,
-              used: {
-                origin: o,
-                destination: t,
-                departDate: dd,
-                returnDate: rr,
-              },
-            };
-          }
-        }
-      }
-    }
-  }
-  return { offers: [], used: null };
-}
-
-// optional: pretty duration
 function isoToReadableDuration(iso?: string) {
   if (!iso?.startsWith("PT")) return "";
   const h = /PT(\d+)H/.exec(iso)?.[1];
   const m = /(\d+)M/.exec(iso)?.[1];
-  const HH = h ? `${h}h` : "";
-  const MM = m ? `${m}m` : "";
-  return `${HH}${HH && MM ? " " : ""}${MM}` || iso;
+  return `${h ? `${h}h` : ""}${h && m ? " " : ""}${m ? `${m}m` : ""}` || iso;
+}
+
+function ensureReturnAfterDepart(dep?: string, ret?: string) {
+  if (!dep || !ret) return ret;
+  return new Date(ret) >= new Date(dep) ? ret : undefined;
+}
+
+async function withTimeout<T>(
+  fn: (signal?: AbortSignal) => Promise<T>,
+  ms = 3500
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fn(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    const origin = String(body.from || "")
-      .trim()
-      .toUpperCase();
-    const destination = String(body.to || "")
-      .trim()
-      .toUpperCase();
-    const depart = String(body.depart);
-    const ret = body.return ? String(body.return) : undefined;
-    const adults = Math.max(1, Number(body.adults || 1));
-    const cabinMap: Record<
-      string,
-      "ECONOMY" | "PREMIUM_ECONOMY" | "BUSINESS" | "FIRST"
-    > = {
-      M: "ECONOMY",
-      W: "PREMIUM_ECONOMY",
-      C: "BUSINESS",
-      F: "FIRST",
-    };
-    const cabin = cabinMap[String(body.cabin || "M")] ?? "ECONOMY";
+    let origin: string,
+      destination: string,
+      depart: string,
+      ret: string | undefined,
+      adults: number,
+      cabin: "ECONOMY" | "PREMIUM_ECONOMY" | "BUSINESS" | "FIRST";
 
-    const IATA = /^[A-Z]{3}$/;
-    if (!IATA.test(origin) || !IATA.test(destination)) {
+    if (body.query) {
+      const parsed = await llmParseQuery(String(body.query));
+      origin = String(parsed.origin || "").toUpperCase();
+      destination = String(parsed.destination || "").toUpperCase();
+      depart = String(parsed.depart || "");
+      ret = parsed.ret ? String(parsed.ret) : undefined;
+      adults = Math.max(1, Number(parsed.adults || 1));
+      cabin =
+        (String(parsed.cabin || "ECONOMY").toUpperCase() as any) || "ECONOMY";
+    } else {
+      origin = String(body.from || "").toUpperCase();
+      destination = String(body.to || "").toUpperCase();
+      depart = String(body.depart || "");
+      ret = body.return ? String(body.return) : undefined;
+      adults = Math.max(1, Number(body.adults || 1));
+      const cabinMap: Record<string, any> = {
+        M: "ECONOMY",
+        W: "PREMIUM_ECONOMY",
+        C: "BUSINESS",
+        F: "FIRST",
+      };
+      cabin = (cabinMap[String(body.cabin || "M")] || "ECONOMY") as any;
+    }
+
+    ret = ensureReturnAfterDepart(depart, ret);
+
+    if (!origin || !destination || !depart) {
       return NextResponse.json(
-        {
-          error:
-            "Please select valid airports from the dropdown (3-letter IATA codes).",
-        },
+        { error: "Missing origin/destination/depart." },
         { status: 400 }
       );
     }
-    if (!depart) {
-      return NextResponse.json(
-        { error: "Departure date is required." },
-        { status: 400 }
-      );
-    }
 
-    const offers = await searchFlightOffers({
+    let offers = await withTimeout(
+      (signal) =>
+        searchFlightOffers({
+          origin,
+          destination,
+          departDate: depart,
+          returnDate: ret,
+          adults,
+          cabin,
+          currency: "USD",
+          max: 50,
+          signal,
+        }),
+      5000
+    );
+
+    let used: any = {
       origin,
       destination,
       departDate: depart,
       returnDate: ret,
-      adults,
-      cabin,
-      currency: "USD",
-      max: 50,
-    });
+    };
+    let expandedByLLM = false;
 
-    const results = (offers || []).map((o: any) => {
-      const price = Number(o.price?.grandTotal || 0);
+    if (!offers?.length) {
+      expandedByLLM = true;
+      const combos = await llmExpandCombos({
+        origin,
+        destination,
+        depart,
+        ret,
+      });
 
-      const outItin = o.itineraries?.[0];
-      const segs = outItin?.segments ?? [];
-      const carriers = Array.from(
-        new Set(segs.map((s: any) => s.carrierCode))
-      ).sort();
-      const route = segs
-        .map(
-          (s: any) =>
-            `${s.departure?.iataCode}→${s.arrival?.iataCode} (${s.carrierCode}${
-              s.number ?? ""
-            })`
-        )
-        .join(" · ");
-      const stops = Math.max(0, segs.length - 1);
-      const duration = isoToReadableDuration(outItin?.duration);
+      const score = (c: any) => {
+        let s = 0;
+        if (c.origin === origin) s -= 2;
+        if (c.destination === destination) s -= 2;
+        const d0 = new Date(depart).getTime();
+        const d1 = new Date(c.depart).getTime();
+        s += Math.abs(d1 - d0) / (1000 * 60 * 60 * 24);
+        return s;
+      };
+      const ordered = combos.sort((a, b) => score(a) - score(b)).slice(0, 12);
 
+      const found = await runWithLimit(ordered, 4, async (c) => {
+        const rr = ensureReturnAfterDepart(c.depart, c.ret ?? undefined);
+        try {
+          const next = await withTimeout(
+            (signal) =>
+              searchFlightOffers({
+                origin: String(c.origin).toUpperCase(),
+                destination: String(c.destination).toUpperCase(),
+                departDate: String(c.depart),
+                returnDate: rr,
+                adults,
+                cabin,
+                currency: "USD",
+                max: 30,
+
+                signal,
+              }),
+            3500
+          );
+          if (next?.length) {
+            return {
+              offers: next,
+              used: {
+                origin: String(c.origin).toUpperCase(),
+                destination: String(c.destination).toUpperCase(),
+                departDate: String(c.depart),
+                returnDate: rr,
+              },
+            };
+          }
+        } catch {
+          // ignore; try next combo
+        }
+        return null;
+      });
+
+      if (found) {
+        offers = found.offers;
+        used = found.used;
+      } else {
+        if (cabin === "BUSINESS") {
+          try {
+            const econ = await withTimeout(
+              (signal) =>
+                searchFlightOffers({
+                  origin,
+                  destination,
+                  departDate: depart,
+                  returnDate: ret,
+                  adults,
+                  cabin: "ECONOMY",
+                  currency: "USD",
+                  max: 20,
+
+                  signal,
+                }),
+              4000
+            );
+            if (econ?.length) {
+              offers = econ;
+              used = { ...used, note: "No business found; showing economy." };
+            }
+          } catch (e) {
+            console.error(`Failed Buisness and Econemy: ${e}`);
+          }
+        }
+      }
+    }
+
+    if (!offers?.length) {
+      return NextResponse.json({
+        results: [],
+        used,
+        note: expandedByLLM
+          ? "No offers found even after expanding via AI. Try broader dates or airports."
+          : "No offers found. We can try AI-based expansion if you enable it.",
+        expandedByLLM,
+      });
+    }
+
+    const results = offers.map((o: any) => {
+      const it = o.itineraries?.[0];
+      const segs = it?.segments ?? [];
       return {
-        price,
-        duration,
-        stops,
-        route,
-        carriers,
+        price: Number(o.price?.grandTotal || 0),
+        duration: isoToReadableDuration(it?.duration),
+        stops: Math.max(0, segs.length - 1),
+        route: segs
+          .map(
+            (s: any) =>
+              `${s.departure?.iataCode}→${s.arrival?.iataCode} (${
+                s.carrierCode
+              }${s.number ?? ""})`
+          )
+          .join(" · "),
+        carriers: Array.from(
+          new Set(segs.map((s: any) => s.carrierCode))
+        ).sort(),
         deep_link: null,
         _raw: { id: o.id },
       };
@@ -158,10 +225,14 @@ export async function POST(req: Request) {
       a.price !== b.price ? a.price - b.price : a.stops - b.stops
     );
 
-    return NextResponse.json({ results: results.slice(0, 12) });
+    return NextResponse.json({
+      results: results.slice(0, 12),
+      used,
+      expandedByLLM,
+    });
   } catch (e: any) {
     return NextResponse.json(
-      { error: e.message || "Unexpected error" },
+      { error: String(e.message || e) },
       { status: 500 }
     );
   }

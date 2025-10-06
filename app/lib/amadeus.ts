@@ -98,6 +98,7 @@ export async function searchFlightOffers(args: {
   cabin?: "ECONOMY" | "PREMIUM_ECONOMY" | "BUSINESS" | "FIRST";
   currency?: string;
   max?: number;
+  signal?: AbortSignal;
 }) {
   const token = await getAmadeusToken();
   const params = new URLSearchParams({
@@ -113,6 +114,7 @@ export async function searchFlightOffers(args: {
 
   const res = await fetch(`${OFFERS_URL}?${params}`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal: args.signal,
   });
   if (!res.ok)
     throw new Error(`Offers search failed: ${res.status} ${await res.text()}`);
