@@ -7,8 +7,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "CODA AI",
-  description: "Upload a url and learn",
+  title: "Flight Finder",
+  description: "Find cheap flights",
 };
 
 export default function RootLayout({
