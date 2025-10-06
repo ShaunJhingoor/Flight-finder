@@ -24,6 +24,7 @@ Return ONLY JSON. Fields:
   const res = await client.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.2,
+    response_format: { type: "json_object" },
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -45,21 +46,18 @@ function safeParseCombos(raw: string): Array<{
   ret?: string | null;
 }> {
   try {
-    // Preferred: { "combos": [...] }
     const obj = JSON.parse(raw);
-    if (Array.isArray(obj)) return obj; // if model returns array directly
+    if (Array.isArray(obj)) return obj;
     if (obj && Array.isArray(obj.combos)) return obj.combos;
   } catch {
     /* fall through to regex */
   }
 
-  // Strip code fences if present
   const cleaned = raw
     .replace(/```(?:json)?/gi, "")
     .replace(/```/g, "")
     .trim();
 
-  // Try to find the first [...] block
   const m = cleaned.match(/\[[\s\S]*\]/);
   if (m) {
     try {
@@ -68,7 +66,6 @@ function safeParseCombos(raw: string): Array<{
     } catch {}
   }
 
-  // Try to find {"combos":[...]}
   const m2 = cleaned.match(/\{\s*"combos"\s*:\s*\[[\s\S]*\]\s*\}/);
   if (m2) {
     try {
@@ -107,7 +104,7 @@ export async function llmExpandCombos(input: {
   const res = await client.chat.completions.create({
     model: "gpt-4o-mini",
     temperature: 0.3,
-    response_format: { type: "json_object" }, // <-- force valid JSON object
+    response_format: { type: "json_object" },
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -115,10 +112,9 @@ export async function llmExpandCombos(input: {
   });
 
   const raw = res.choices[0].message?.content ?? `{"combos":[]}`;
-  // If the model *still* returns an array, safeParseCombos will handle it.
+
   const combos = safeParseCombos(raw);
 
-  // Normalize + validate
   const today = new Date(
     new Date().toISOString().slice(0, 10) + "T00:00:00Z"
   ).getTime();
