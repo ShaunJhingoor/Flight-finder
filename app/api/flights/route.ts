@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { searchFlightOffers } from "../../lib/amadeus";
 import { llmParseQuery, llmExpandCombos } from "../../lib/llmagent";
-import { runWithLimit } from "../../utils/concurrency";
+import { runWithLimit, withRetry } from "../../utils/concurrency";
 
 export const runtime = "nodejs";
 
@@ -74,7 +74,8 @@ export async function POST(req: Request) {
       );
     }
 
-    let offers = await withTimeout(
+    // Initial search
+    let offers = await withRetry(
       (signal) =>
         searchFlightOffers({
           origin,
@@ -87,7 +88,7 @@ export async function POST(req: Request) {
           max: 50,
           signal,
         }),
-      5000
+      { attempts: 2, timeoutMs: 10000 } // more generous
     );
 
     let used: any = {
@@ -121,7 +122,7 @@ export async function POST(req: Request) {
       const found = await runWithLimit(ordered, 4, async (c) => {
         const rr = ensureReturnAfterDepart(c.depart, c.ret ?? undefined);
         try {
-          const next = await withTimeout(
+          const next = await withRetry(
             (signal) =>
               searchFlightOffers({
                 origin: String(c.origin).toUpperCase(),
@@ -132,10 +133,9 @@ export async function POST(req: Request) {
                 cabin,
                 currency: "USD",
                 max: 30,
-
                 signal,
               }),
-            3500
+            { attempts: 2, timeoutMs: 9000 }
           );
           if (next?.length) {
             return {
@@ -149,7 +149,7 @@ export async function POST(req: Request) {
             };
           }
         } catch {
-          // ignore; try next combo
+          // try next combo
         }
         return null;
       });
