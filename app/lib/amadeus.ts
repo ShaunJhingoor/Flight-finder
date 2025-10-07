@@ -51,7 +51,7 @@ export async function getAmadeusToken(): Promise<string> {
 }
 
 async function authedFetch(url: string | URL) {
-  let token = await getAmadeusToken();
+  const token = await getAmadeusToken();
   let res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   });
