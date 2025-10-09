@@ -1,13 +1,20 @@
-// app/api/flights/route.ts — token-safe agent (no large tool payloads in messages)
+// app/api/flights/route.ts — FAST, TRUE AGENT (planning-only), TOKEN-SAFE
+// ------------------------------------------------------------------
+// Agent does: parse NL + propose small combos (tiny JSON).
+// Code does: all Amadeus I/O locally, with parallelism, timeouts, and early-exit.
+// ------------------------------------------------------------------
 
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import fetch from "node-fetch";
 
-// -------------------- OPENAI --------------------
+// ---------- RUNTIME ----------
+export const runtime = "nodejs";
+
+// ---------- OPENAI (tiny calls only) ----------
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-// -------------------- AMADEUS -------------------
+// ---------- AMADEUS CONFIG ----------
 const IS_LIVE = (process.env.AMADEUS_ENV || "").toLowerCase() === "live";
 const BASE = IS_LIVE
   ? "https://api.amadeus.com"
@@ -56,7 +63,7 @@ async function getAmadeusToken(): Promise<string> {
   return cachedToken.access_token;
 }
 
-// -------------------- UTILS --------------------
+// ---------- UTILS ----------
 function isoToReadableDuration(iso?: string) {
   if (!iso?.startsWith("PT")) return "";
   const h = /PT(\d+)H/.exec(iso)?.[1];
@@ -94,8 +101,27 @@ async function withRetry<T>(
   }
   throw last;
 }
+async function firstSuccessful<T>(
+  tasks: Array<() => Promise<T>>
+): Promise<T | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v: T | null) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    for (const t of tasks)
+      t()
+        .then((v) => finish(v))
+        .catch(() => {});
+    // If all reject, nothing calls finish; add a guard timeout if you want
+    setTimeout(() => finish(null), 12000);
+  });
+}
 
-// -------------------- AMADEUS CALL --------------------
+// ---------- AMADEUS SEARCH ----------
 async function searchFlightOffers(args: {
   origin: string;
   destination: string;
@@ -157,18 +183,17 @@ function simplifyAndRank(offers: any[]) {
   return results.slice(0, 12);
 }
 
-// -------------------- TOOLS (TINY RESPONSES) --------------------
+// ---------- TOOLS (tiny JSON only) ----------
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
       name: "parse_query",
-      description: "Parse NL flight request into structured params",
+      description: "Parse NL flight request to structured params",
       parameters: {
         type: "object",
         properties: { query: { type: "string" } },
         required: ["query"],
-        additionalProperties: false,
       },
     },
   },
@@ -176,7 +201,7 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "expand_combos",
-      description: "Propose up to 8 nearby-airport ±2-day combos",
+      description: "Nearby airports & ±2-day combos (<=8), tiny JSON only",
       parameters: {
         type: "object",
         properties: {
@@ -186,14 +211,10 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           ret: { type: ["string", "null"] },
         },
         required: ["origin", "destination", "depart"],
-        additionalProperties: false,
       },
     },
   },
 ];
-
-// Keep large data OFF the message stream: store it here by tool_call_id.
-const toolStore = new Map<string, any>();
 
 type FnToolCall = {
   id: string;
@@ -208,15 +229,14 @@ function isFnToolCall(x: any): x is FnToolCall {
     typeof x.function.name === "string"
   );
 }
-function safeJson(s: string) {
+function safeJson<T = any>(s: string): T {
   try {
-    return JSON.parse(s);
+    return JSON.parse(s) as T;
   } catch {
-    return {};
+    return {} as T;
   }
 }
 
-// -------------------- TOOL EXECUTORS --------------------
 async function exec_parse_query(args: { query: string }) {
   const system = `Only JSON: { origin, destination, depart:YYYY-MM-DD, ret:YYYY-MM-DD|null, adults, cabin }`;
   const res = await client.chat.completions.create({
@@ -229,9 +249,8 @@ async function exec_parse_query(args: { query: string }) {
       { role: "user", content: `Query: "${args.query}"` },
     ],
   });
-  const raw = res.choices[0].message?.content?.trim() || "{}";
   try {
-    return JSON.parse(raw);
+    return JSON.parse(res.choices[0].message?.content ?? "{}");
   } catch {
     return {};
   }
@@ -243,9 +262,8 @@ async function exec_expand_combos(args: {
   depart: string;
   ret?: string | null;
 }) {
-  const system =
-    `Only JSON: { "combos": [ { "origin":"...","destination":"...","depart":"YYYY-MM-DD","ret":"YYYY-MM-DD|null" } ] }\n` +
-    `Max 8; Nearby(NYC=JFK/LGA/EWR; RIC=DCA/IAD/ORF; LAX=BUR/LGB/SNA/ONT; SFO=SJC/OAK; LON=LHR/LGW/LCY; TYO=NRT/HND); ±2 days; no past; ret>=depart.`;
+  const system = `Only JSON: { "combos": [ { "origin":"...","destination":"...","depart":"YYYY-MM-DD","ret":"YYYY-MM-DD|null" } ] }
+Max 8; NYC=JFK/LGA/EWR; RIC=DCA/IAD/ORF; LAX=BUR/LGB/SNA/ONT; SFO=SJC/OAK; LON=LHR/LGW/LCY; TYO=NRT/HND; ±2 days; no past; ret>=depart.`;
   const user = `origin=${args.origin} destination=${args.destination} depart=${
     args.depart
   } ret=${args.ret ?? "null"} today=${new Date().toISOString().slice(0, 10)}`;
@@ -284,7 +302,7 @@ async function exec_expand_combos(args: {
         c.origin &&
         c.destination &&
         c.depart &&
-        !isNaN(new Date(c.depart + "T00:00:00Z").getTime()) &&
+        !isNaN(Date.parse(c.depart)) &&
         new Date(c.depart + "T00:00:00Z").getTime() >= today &&
         (!c.ret ||
           new Date(c.ret + "T00:00:00Z").getTime() >=
@@ -293,12 +311,12 @@ async function exec_expand_combos(args: {
     .slice(0, 8);
 }
 
-// -------------------- AGENT LOOP (SHORT) --------------------
-const AGENT_SYSTEM = `You are FlightAgent. Call tools, keep outputs tiny. Never echo large arrays. Finish as soon as you have results. Return JSON only.`;
+// ---------- AGENT (single hop; planning-only) ----------
+const AGENT_SYSTEM = `You are FlightAgent. Use tools to (1) parse the query then (2) optionally propose small combos. Do NOT fetch offers yourself. Return JSON only.`;
 
 async function agent(
-  goalMessage: string,
-  seedParams?: Partial<{
+  goal: string,
+  seed?: Partial<{
     origin: string;
     destination: string;
     depart: string;
@@ -309,155 +327,80 @@ async function agent(
 ) {
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: AGENT_SYSTEM },
-    { role: "user", content: goalMessage },
+    { role: "user", content: goal },
   ];
-  if (seedParams && Object.keys(seedParams).length) {
-    messages.push({
-      role: "user",
-      content: `Seed: ${JSON.stringify(seedParams)}`,
-    });
+  if (seed && Object.keys(seed).length)
+    messages.push({ role: "user", content: `Seed: ${JSON.stringify(seed)}` });
+
+  const resp = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    max_tokens: 200,
+    tools,
+    tool_choice: "auto",
+    messages,
+  });
+
+  let params: any = { ...seed };
+  let combos: any[] = [];
+  const msg = resp.choices[0].message!;
+  const calls = (msg.tool_calls ?? []) as any[];
+
+  for (const c of calls) {
+    if (!isFnToolCall(c)) continue;
+    const { name, arguments: argsStr } = c.function;
+    const args = safeJson(argsStr);
+    if (name === "parse_query")
+      params = { ...params, ...(await exec_parse_query(args)) };
+    if (name === "expand_combos") combos = await exec_expand_combos(args);
   }
-
-  const MAX_STEPS = 3;
-  let state: any = { used: {}, expandedByLLM: false, results: [] };
-
-  for (let step = 0; step < MAX_STEPS; step++) {
-    const resp = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      max_tokens: 200,
-      tools,
-      tool_choice: "auto",
-      messages,
-    });
-
-    const msg = resp.choices[0].message!;
-    const calls = (msg.tool_calls ?? []) as any[];
-
-    if (calls.length) {
-      // Store the assistant message stub (no big content)
-      messages.push({
-        role: "assistant",
-        content: msg.content || "",
-        tool_calls: calls as any,
-      } as any);
-
-      for (const c of calls) {
-        if (!isFnToolCall(c)) continue;
-        const { name, arguments: argsStr } = c.function;
-        const args = safeJson(argsStr);
-
-        try {
-          if (name === "parse_query") {
-            const out = await exec_parse_query(args);
-            toolStore.set(c.id, out);
-            messages.push({
-              role: "tool",
-              tool_call_id: c.id,
-              content: JSON.stringify({ ok: true }),
-            } as any);
-          } else if (name === "expand_combos") {
-            state.expandedByLLM = true;
-            const out = await exec_expand_combos(args);
-            toolStore.set(c.id, { combos: out });
-            messages.push({
-              role: "tool",
-              tool_call_id: c.id,
-              content: JSON.stringify({ ok: true, n: out.length }),
-            } as any);
-          } else {
-            // Unknown tool name; ACK tiny
-            messages.push({
-              role: "tool",
-              tool_call_id: c.id,
-              content: JSON.stringify({ ok: false, error: "unknown_tool" }),
-            } as any);
-          }
-        } catch (e: any) {
-          messages.push({
-            role: "tool",
-            tool_call_id: c.id,
-            content: JSON.stringify({
-              ok: false,
-              error: String(e?.message || e),
-            }),
-          } as any);
-        }
-      }
-
-      // Keep iterating; model will read tiny tool ACKs and decide next call
-      continue;
-    }
-
-    // If model emits final JSON early, try to parse and return
-    if (msg.content) {
-      try {
-        return JSON.parse(msg.content);
-      } catch {}
-      // If we already computed results elsewhere, return them
-      if (state.results?.length)
-        return {
-          results: state.results,
-          used: state.used,
-          expandedByLLM: state.expandedByLLM,
-        };
-      // Otherwise nudge once
-      messages.push({
-        role: "user",
-        content: "Please provide final JSON, or call a tool.",
-      });
-    }
-  }
-
-  return {
-    results: state.results ?? [],
-    used: state.used ?? {},
-    expandedByLLM: state.expandedByLLM,
-    note: "Reached max steps.",
-  };
+  return { params, combos };
 }
 
-// -------------------- HTTP HANDLER --------------------
-export const runtime = "nodejs";
-
+// ---------- HTTP HANDLER ----------
 export async function POST(req: Request) {
   try {
     const body = await req.json();
 
-    // Prefer structured path; LLM only if needed for parsing or combos.
-    let origin: string,
-      destination: string,
-      depart: string,
-      ret: string | undefined,
-      adults: number,
-      cabin: "ECONOMY" | "PREMIUM_ECONOMY" | "BUSINESS" | "FIRST";
+    // Seed from structured input if present
+    const seed =
+      body.from || body.to || body.depart
+        ? {
+            origin: String(body.from || "").toUpperCase(),
+            destination: String(body.to || "").toUpperCase(),
+            depart: String(body.depart || ""),
+            ret: body.return ? String(body.return) : undefined,
+            adults: Math.max(1, Number(body.adults || 1)),
+            cabin:
+              (
+                {
+                  M: "ECONOMY",
+                  W: "PREMIUM_ECONOMY",
+                  C: "BUSINESS",
+                  F: "FIRST",
+                } as any
+              )[String(body.cabin || "M")] || "ECONOMY",
+          }
+        : undefined;
 
-    if (body.query) {
-      // Let the tiny tool parse it:
-      const parsed = await exec_parse_query({ query: String(body.query) });
-      origin = String(parsed.origin || "").toUpperCase();
-      destination = String(parsed.destination || "").toUpperCase();
-      depart = String(parsed.depart || "");
-      ret = parsed.ret ? String(parsed.ret) : undefined;
-      adults = Math.max(1, Number(parsed.adults || 1));
-      cabin =
-        (String(parsed.cabin || "ECONOMY").toUpperCase() as any) || "ECONOMY";
-    } else {
-      origin = String(body.from || "").toUpperCase();
-      destination = String(body.to || "").toUpperCase();
-      depart = String(body.depart || "");
-      ret = body.return ? String(body.return) : undefined;
-      adults = Math.max(1, Number(body.adults || 1));
-      const cabinMap: Record<string, any> = {
-        M: "ECONOMY",
-        W: "PREMIUM_ECONOMY",
-        C: "BUSINESS",
-        F: "FIRST",
-      };
-      cabin = (cabinMap[String(body.cabin || "M")] || "ECONOMY") as any;
-    }
+    const goal = body.query
+      ? `Find flights for: ${String(body.query)}`
+      : `Find flights for structured params`;
 
-    ret = ensureReturnAfterDepart(depart, ret);
+    // 1) Agent planning (one LLM call)
+    const { params, combos } = await agent(goal, seed);
+
+    // 2) Resolve final inputs
+    const origin = String(params.origin || seed?.origin || "").toUpperCase();
+    const destination = String(
+      params.destination || seed?.destination || ""
+    ).toUpperCase();
+    const depart = String(params.depart || seed?.depart || "");
+    const ret = ensureReturnAfterDepart(depart, params.ret ?? seed?.ret);
+    const adults = Math.max(1, Number(params.adults || seed?.adults || 1));
+    const cabin = String(
+      params.cabin || seed?.cabin || "ECONOMY"
+    ).toUpperCase() as any;
 
     if (!origin || !destination || !depart) {
       return NextResponse.json(
@@ -466,7 +409,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Primary search
+    // 3) Primary Amadeus search (retry + timeout)
     let offers = await withRetry(
       (signal) =>
         searchFlightOffers({
@@ -477,10 +420,10 @@ export async function POST(req: Request) {
           adults,
           cabin,
           currency: "USD",
-          max: 50,
+          max: 40,
           signal,
         }),
-      { attempts: 2, timeoutMs: 10000 }
+      { attempts: 2, timeoutMs: 9000 }
     );
 
     let used: any = {
@@ -491,98 +434,100 @@ export async function POST(req: Request) {
     };
     let expandedByLLM = false;
 
-    if (!offers?.length) {
-      // Ask LLM for small combo suggestions (tiny JSON), then try them locally.
+    // 4) If none, try agent-proposed combos — run in PARALLEL (limit=4) with EARLY EXIT
+    if (!offers?.length && combos?.length) {
       expandedByLLM = true;
-      const combos = await exec_expand_combos({
-        origin,
-        destination,
-        depart,
-        ret: ret ?? null,
-      });
+      const d0 = new Date(depart).getTime();
+      const ordered = [...combos]
+        .sort((a: any, b: any) => {
+          const score = (c: any) =>
+            (c.origin === origin ? -2 : 0) +
+            (c.destination === destination ? -2 : 0) +
+            Math.abs(new Date(c.depart).getTime() - d0) / (1000 * 60 * 60 * 24);
+          return score(a) - score(b);
+        })
+        .slice(0, 12);
 
-      const score = (c: any) => {
-        let s = 0;
-        if (c.origin === origin) s -= 2;
-        if (c.destination === destination) s -= 2;
-        const d0 = new Date(depart).getTime();
-        const d1 = new Date(c.depart).getTime();
-        s += Math.abs(d1 - d0) / (1000 * 60 * 60 * 24);
-        return s;
-      };
-      const ordered = combos.sort((a, b) => score(a) - score(b)).slice(0, 8);
-
-      for (const c of ordered) {
+      const tasks = ordered.map((c: any) => async () => {
         const rr = ensureReturnAfterDepart(c.depart, c.ret ?? undefined);
-        try {
-          const next = await withRetry(
-            (signal) =>
-              searchFlightOffers({
-                origin: String(c.origin).toUpperCase(),
-                destination: String(c.destination).toUpperCase(),
-                departDate: String(c.depart),
-                returnDate: rr,
-                adults,
-                cabin,
-                currency: "USD",
-                max: 30,
-                signal,
-              }),
-            { attempts: 1, timeoutMs: 8000 }
-          );
-          if (next?.length) {
-            offers = next;
-            used = {
+        const next = await withRetry(
+          (signal) =>
+            searchFlightOffers({
               origin: String(c.origin).toUpperCase(),
               destination: String(c.destination).toUpperCase(),
               departDate: String(c.depart),
               returnDate: rr,
-            };
-            break;
-          }
-        } catch {
-          /* try next combo */
-        }
-      }
+              adults,
+              cabin,
+              currency: "USD",
+              max: 30,
+              signal,
+            }),
+          { attempts: 1, timeoutMs: 7000 }
+        );
+        if (next?.length)
+          return {
+            offers: next,
+            used: {
+              origin: c.origin,
+              destination: c.destination,
+              departDate: c.depart,
+              returnDate: rr,
+            },
+          };
+        throw new Error("no-offers");
+      });
 
-      if (!offers?.length && cabin === "BUSINESS") {
-        try {
-          const econ = await withTimeout(
-            (signal) =>
-              searchFlightOffers({
-                origin,
-                destination,
-                departDate: depart,
-                returnDate: ret,
-                adults,
-                cabin: "ECONOMY",
-                currency: "USD",
-                max: 20,
-                signal,
-              }),
-            4000
-          );
-          if (econ?.length) {
-            offers = econ;
-            used = { ...used, note: "No business found; showing economy." };
-          }
-        } catch {}
+      // chunk into groups of 4 and early-exit as soon as any find results
+      for (let i = 0; i < tasks.length && !offers?.length; i += 4) {
+        const batch = tasks.slice(i, i + 4);
+        const found = await firstSuccessful(batch);
+        if (found) {
+          offers = (found as any).offers;
+          used = (found as any).used;
+          break;
+        }
       }
     }
 
+    // 5) Business fallback → quick ECONOMY search
+    if (!offers?.length && cabin === "BUSINESS") {
+      try {
+        const econ = await withTimeout(
+          (signal) =>
+            searchFlightOffers({
+              origin,
+              destination,
+              departDate: depart,
+              returnDate: ret,
+              adults,
+              cabin: "ECONOMY",
+              currency: "USD",
+              max: 20,
+              signal,
+            }),
+          3500
+        );
+        if (econ?.length) {
+          offers = econ;
+          used = { ...used, note: "No business found; showing economy." };
+        }
+      } catch {}
+    }
+
+    // 6) Return
     if (!offers?.length) {
       return NextResponse.json({
         results: [],
         used,
-        note: expandedByLLM
-          ? "No offers found even after expanding via AI. Try broader dates or airports."
-          : "No offers found. We can try AI-based expansion if you enable it.",
         expandedByLLM,
+        note: expandedByLLM
+          ? "No offers found after AI expansion."
+          : "No offers found.",
       });
     }
 
     const results = simplifyAndRank(offers);
-
     return NextResponse.json({ results, used, expandedByLLM });
   } catch (e: any) {
     return NextResponse.json(
