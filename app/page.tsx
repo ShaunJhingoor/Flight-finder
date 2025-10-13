@@ -1,14 +1,17 @@
 "use client";
 import { useState } from "react";
 import AirportAutocomplete from "./components/AirportAutocomplete";
-import image from "./assets/bgImage.png";
 type Result = {
   price: number;
   duration: string;
   stops: number;
   route: string;
   carriers: string[];
-  deep_link: string | null;
+  deep_links?: {
+    google_flights?: string;
+    kayak?: string;
+    skyscanner?: string;
+  };
 };
 
 export default function FlightsPage() {
@@ -32,6 +35,7 @@ export default function FlightsPage() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Search failed");
+      console.log(json.results);
       setResults(json.results || []);
     } catch (err: any) {
       setError(err.message || "Something went wrong");
@@ -114,14 +118,21 @@ export default function FlightsPage() {
                     ${r.price} • {r.stops} stop{r.stops === 1 ? "" : "s"} •{" "}
                     {r.duration}
                   </div>
-                  <button
-                    className="underline"
-                    onClick={() =>
-                      alert("Implement pricing/booking flow next.")
-                    }
-                  >
-                    Select
-                  </button>
+
+                  {r?.deep_links && (
+                    <button
+                      className="underline"
+                      onClick={() => {
+                        const url =
+                          r.deep_links?.skyscanner ||
+                          r.deep_links?.kayak ||
+                          r.deep_links?.google_flights;
+                        if (url) window.open(url, "_blank");
+                      }}
+                    >
+                      Select
+                    </button>
+                  )}
                 </div>
                 <div className="text-sm opacity-85">{r.route}</div>
                 <div className="text-xs opacity-60">

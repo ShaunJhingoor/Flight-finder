@@ -1,7 +1,7 @@
 // components/AirportAutocomplete.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Option = {
   type: "CITY" | "AIRPORT";
