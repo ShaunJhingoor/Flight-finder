@@ -147,7 +147,7 @@ async function searchFlightOffers(args: {
 
   const res = await fetch(`${OFFERS_URL}?${params}`, {
     headers: { Authorization: `Bearer ${token}` },
-    // @ts-ignore
+    //@typescript-eslint/ban-ts-comment
     signal: args.signal,
   });
   if (!res.ok)
@@ -156,11 +156,122 @@ async function searchFlightOffers(args: {
   return (data?.data ?? []) as any[];
 }
 
-function simplifyAndRank(offers: any[]) {
+function toYMD(d: string) {
+  return d.slice(0, 10);
+}
+function gfCabin(cabin: string) {
+  return (
+    { ECONOMY: "e", PREMIUM_ECONOMY: "p", BUSINESS: "b", FIRST: "f" }[
+      cabin || "ECONOMY"
+    ] || "e"
+  );
+}
+function kayakCabin(cabin: string) {
+  return (
+    { ECONOMY: "e", PREMIUM_ECONOMY: "p", BUSINESS: "b", FIRST: "f" }[
+      cabin || "ECONOMY"
+    ] || "e"
+  );
+}
+function buildGoogleFlightsURL({
+  origin,
+  destination,
+  departDate,
+  returnDate,
+  adults = 1,
+  cabin = "ECONOMY",
+}: {
+  origin: string;
+  destination: string;
+  departDate: string;
+  returnDate?: string | null;
+  adults?: number;
+  cabin?: string;
+}) {
+  const c = gfCabin(cabin);
+
+  const out = `${origin}.${destination}.${toYMD(departDate)}`;
+  const back = returnDate
+    ? `*${destination}.${origin}.${toYMD(returnDate)}`
+    : "";
+  return `https://www.google.com/travel/flights#flt=${out}${back};c:${c};px:${adults}`;
+}
+function buildKayakURL({
+  origin,
+  destination,
+  departDate,
+  returnDate,
+  adults = 1,
+  cabin = "ECONOMY",
+}: {
+  origin: string;
+  destination: string;
+  departDate: string;
+  returnDate?: string | null;
+  adults?: number;
+  cabin?: string;
+}) {
+  const c = kayakCabin(cabin);
+
+  const base = `https://www.kayak.com/flights/${origin}-${destination}/${toYMD(
+    departDate
+  )}`;
+  const rt = returnDate ? `/${destination}-${origin}/${toYMD(returnDate)}` : "";
+  const q = new URLSearchParams({ adults: String(adults), c: c }).toString();
+  return `${base}${rt}?${q}`;
+}
+
+// Optionally Skyscanner (works well too)
+function buildSkyscannerURL({
+  origin,
+  destination,
+  departDate,
+  returnDate,
+  adults = 1,
+  cabin = "ECONOMY",
+}: {
+  origin: string;
+  destination: string;
+  departDate: string;
+  returnDate?: string | null;
+  adults?: number;
+  cabin?: string;
+}) {
+  // Skyscanner format: /transport/flights/ORIG/DEST/YYMMDD[/YYMMDD]/?adults=1&cabinclass=economy|premiumeconomy|business|first
+  const cc = {
+    ECONOMY: "economy",
+    PREMIUM_ECONOMY: "premiumeconomy",
+    BUSINESS: "business",
+    FIRST: "first",
+  }[cabin || "ECONOMY"]!;
+  const fmt = (d: string) => d.replace(/-/g, "").slice(2); // YYMMDD
+  const out = `${origin}/${destination}/${fmt(departDate)}`;
+  const back = returnDate ? `/${fmt(returnDate)}` : "";
+  const q = new URLSearchParams({
+    adults: String(adults),
+    cabinclass: cc,
+  }).toString();
+  return `https://www.skyscanner.com/transport/flights/${out}${back}/?${q}`;
+}
+
+function simplifyAndRank(
+  offers: any[],
+  ctx?: {
+    origin: string;
+    destination: string;
+    departDate: string;
+    returnDate?: string | null;
+    adults?: number;
+    cabin?: string;
+  }
+) {
   const results = offers.map((o) => {
     const it = o.itineraries?.[0];
     const segs = it?.segments ?? [];
-    return {
+    const carriers = Array.from(
+      new Set(segs.map((s: any) => s.carrierCode))
+    ).sort();
+    const base = {
       price: Number(o.price?.grandTotal || 0),
       duration: isoToReadableDuration(it?.duration),
       stops: Math.max(0, segs.length - 1),
@@ -172,11 +283,31 @@ function simplifyAndRank(offers: any[]) {
             })`
         )
         .join(" · "),
-      carriers: Array.from(new Set(segs.map((s: any) => s.carrierCode))).sort(),
-      deep_link: null,
+      carriers,
       _raw: { id: o.id },
     };
+
+    if (ctx?.origin && ctx?.destination && ctx?.departDate) {
+      const linkArgs = {
+        origin: ctx.origin,
+        destination: ctx.destination,
+        departDate: ctx.departDate,
+        returnDate: ctx.returnDate ?? undefined,
+        adults: ctx.adults ?? 1,
+        cabin: ctx.cabin ?? "ECONOMY",
+      };
+      return {
+        ...base,
+        deep_links: {
+          google_flights: buildGoogleFlightsURL(linkArgs),
+          kayak: buildKayakURL(linkArgs),
+          skyscanner: buildSkyscannerURL(linkArgs),
+        },
+      };
+    }
+    return { ...base, deep_links: null };
   });
+
   results.sort((a: any, b: any) =>
     a.price !== b.price ? a.price - b.price : a.stops - b.stops
   );
@@ -527,7 +658,15 @@ export async function POST(req: Request) {
       });
     }
 
-    const results = simplifyAndRank(offers);
+    const results = simplifyAndRank(offers, {
+      origin: used.origin,
+      destination: used.destination,
+      departDate: used.departDate,
+      returnDate: used.returnDate ?? undefined,
+      adults,
+      cabin,
+    });
+
     return NextResponse.json({ results, used, expandedByLLM });
   } catch (e: any) {
     return NextResponse.json(
